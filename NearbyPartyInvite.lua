@@ -1,5 +1,5 @@
--- NearbyPartyInvite main addon file
--- Handles minimap button, combat log scanning, popup confirmation, and chat commands
+-- NearbyPartyInvite
+-- Lists nearby friendly players, lets you pick a quest, whisper an ask, and invite by button.
 
 local NPI_AddonName, NPI_Addon = ...
 NearbyPartyInvite = NPI_Addon
@@ -10,20 +10,13 @@ local NPI_Frame = CreateFrame("Frame")
 NPI_Addon.frame = NPI_Frame
 
 NPI_Addon.invited = {}
-NPI_Addon.ignored = {}
 NPI_Addon.pendingInvites = {}
-NPI_Addon.enabled = false
 NPI_Settings = NPI_Settings or {}
 if NPI_Settings.whisperEnabled == nil then
     NPI_Settings.whisperEnabled = false
 end
 NPI_Settings.whisperMessage = NPI_Settings.whisperMessage or ""
-if NPI_Settings.triggerMouseover == nil then
-    NPI_Settings.triggerMouseover = true
-end
-if NPI_Settings.triggerTarget == nil then
-    NPI_Settings.triggerTarget = true
-end
+
 local NPI_Verbosity = { none = 0, default = 1, high = 2, debug = 3 }
 local NPI_VerbosityTexts = {
     none = L.NONE_VALUE,
@@ -40,6 +33,7 @@ local NPI_VerbosityNames = {
 if NPI_Settings.verbosity == nil then
     NPI_Settings.verbosity = NPI_Verbosity.default
 end
+
 local function NPI_Print(level, msg)
     if type(level) ~= "number" then
         level = NPI_Verbosity.default
@@ -51,33 +45,43 @@ local function NPI_Print(level, msg)
         DEFAULT_CHAT_FRAME:AddMessage(L.ADDON_TITLE .. ": " .. msg)
     end
 end
-local NPI_PendingInvite = nil
+
 local NPI_PlayerName, NPI_PlayerRealm = UnitName("player")
 local NPI_PlayerFullName = NPI_PlayerRealm and NPI_PlayerRealm ~= "" and NPI_PlayerName .. "-" .. NPI_PlayerRealm or NPI_PlayerName
 local NPI_PlayerFaction = UnitFactionGroup("player")
-local NPI_PendingWhisper = nil
-local NPI_GroupFullWarned = false
 
--- Forward declarations for options panel and category
 local NPI_Options, NPI_SettingsCategory
-local NPI_EnableCheck, NPI_WhisperCheck, NPI_MessageInput, NPI_MouseoverCheck, NPI_TargetCheck
-local NPI_IsPlayerInGroup
+local NPI_WhisperCheck, NPI_MessageInput
+local NPI_Nearby = {}
+local NPI_Asks = {}
+local NPI_RowOffset = 0
+local NPI_MAX_ROWS = 8
+local NPI_ROW_HEIGHT = 24
+local NPI_Window
+local NPI_Rows = {}
+local NPI_EmptyText
+local NPI_QuestDropDown
+local NPI_PlatesWarned = false
+local NPI_Ticker
 
---
--- Attempt to invite a player by name after basic checks
-local function NPI_StartInvite(NPI_TargetName)
-    if NPI_Addon.invited[NPI_TargetName] or NPI_Addon.ignored[NPI_TargetName] then
-        NPI_Print(NPI_Verbosity.debug, string.format(L.SKIPPING, NPI_TargetName))
-        return
-    end
-    if NPI_IsPlayerInGroup(NPI_TargetName) then
-        NPI_Print(NPI_Verbosity.debug, string.format(L.ALREADY_IN_GROUP, NPI_TargetName))
-        return
-    end
+local NPI_YES = {
+    yes = true, y = true, yeah = true, yep = true, sure = true, ok = true, okay = true,
+}
+local NPI_NO = {
+    no = true, nope = true, nah = true,
+}
 
-    NPI_Print(NPI_Verbosity.high, string.format(L.PROMPTING_INVITE, NPI_TargetName))
-    NPI_PendingInvite = NPI_TargetName
-    StaticPopup_Show("NPI_CONFIRM_INVITE", NPI_TargetName, nil, {name = NPI_TargetName})
+local function NPI_UpdatePlayer()
+    NPI_PlayerName, NPI_PlayerRealm = UnitName("player")
+    NPI_PlayerFullName = NPI_PlayerRealm and NPI_PlayerRealm ~= "" and NPI_PlayerName .. "-" .. NPI_PlayerRealm or NPI_PlayerName
+    NPI_PlayerFaction = UnitFactionGroup("player")
+end
+
+local function NPI_NameKey(name)
+    if type(name) ~= "string" or name == "" then
+        return nil
+    end
+    return (name:gsub("%s+", "")):lower()
 end
 
 local function NPI_GetPendingInviteCount()
@@ -93,15 +97,21 @@ local function NPI_GetPendingInviteCount()
 end
 
 local function NPI_IsGroupFull()
+    if IsInRaid and IsInRaid() then
+        return false
+    end
     local NPI_GroupSize = GetNumGroupMembers()
-    if NPI_GroupSize == 0 then NPI_GroupSize = 1 end
+    if NPI_GroupSize == 0 then
+        NPI_GroupSize = 1
+    end
     NPI_GroupSize = NPI_GroupSize + NPI_GetPendingInviteCount()
-    NPI_Print(NPI_Verbosity.debug, string.format(L.GROUP_SIZE_WITH_PENDING, NPI_GroupSize))
     return NPI_GroupSize >= 5
 end
 
 function NPI_IsPlayerInGroup(NPI_TargetName)
-    if not IsInGroup() then return false end
+    if not NPI_TargetName or not IsInGroup() then
+        return false
+    end
 
     local NPI_Count = GetNumGroupMembers()
     if IsInRaid() then
@@ -110,18 +120,18 @@ function NPI_IsPlayerInGroup(NPI_TargetName)
             if UnitExists(NPI_Unit) then
                 local NPI_Name, NPI_Realm = UnitName(NPI_Unit)
                 local NPI_FullName = NPI_Realm and NPI_Realm ~= "" and NPI_Name .. "-" .. NPI_Realm or NPI_Name
-                if NPI_FullName == NPI_TargetName then
+                if NPI_FullName == NPI_TargetName or NPI_Name == NPI_TargetName then
                     return true
                 end
             end
         end
     else
-        for NPI_Index = 1, NPI_Count - 1 do
+        for NPI_Index = 1, math.max(NPI_Count - 1, 0) do
             local NPI_Unit = "party" .. NPI_Index
             if UnitExists(NPI_Unit) then
                 local NPI_Name, NPI_Realm = UnitName(NPI_Unit)
                 local NPI_FullName = NPI_Realm and NPI_Realm ~= "" and NPI_Name .. "-" .. NPI_Realm or NPI_Name
-                if NPI_FullName == NPI_TargetName then
+                if NPI_FullName == NPI_TargetName or NPI_Name == NPI_TargetName then
                     return true
                 end
             end
@@ -131,167 +141,656 @@ function NPI_IsPlayerInGroup(NPI_TargetName)
     return false
 end
 
--- Enable or disable auto-invite mode
-function NPI_Addon:Enable()
-    if not self.enabled then
-        self.enabled = true
-        NPI_Frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
-        if NPI_Settings.triggerMouseover then
-            NPI_Frame:RegisterEvent("UPDATE_MOUSEOVER_UNIT")
-        end
-        if NPI_Settings.triggerTarget then
-            NPI_Frame:RegisterEvent("PLAYER_TARGET_CHANGED")
-        end
-        NPI_Frame:RegisterEvent("CHAT_MSG_SYSTEM")
-        NPI_Frame:RegisterEvent("GROUP_ROSTER_UPDATE")
-        if self.minimapButton and self.minimapButton.icon then
-            self.minimapButton.icon:SetDesaturated(false)
-        end
-        if NPI_EnableCheck then
-            NPI_EnableCheck:SetChecked(true)
-        end
+local function NPI_ReadCVar(name)
+    local reader = (C_CVar and C_CVar.GetCVar) or GetCVar
+    if not reader then
+        return nil
     end
+    local ok, value = pcall(reader, name)
+    if not ok then
+        return nil
+    end
+    if value == "1" or value == 1 or value == true then
+        return true
+    end
+    if value == "0" or value == 0 or value == false then
+        return false
+    end
+    return nil
 end
 
-function NPI_Addon:Disable()
-    if self.enabled then
-        self.enabled = false
-        NPI_Frame:UnregisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
-        NPI_Frame:UnregisterEvent("UPDATE_MOUSEOVER_UNIT")
-        NPI_Frame:UnregisterEvent("PLAYER_TARGET_CHANGED")
-        NPI_Frame:UnregisterEvent("CHAT_MSG_SYSTEM")
-        NPI_Frame:UnregisterEvent("GROUP_ROSTER_UPDATE")
-        if self.minimapButton and self.minimapButton.icon then
-            self.minimapButton.icon:SetDesaturated(true)
-        end
-        if NPI_EnableCheck then
-            NPI_EnableCheck:SetChecked(false)
+local NPI_PlateCVars = { "nameplateShowFriendlyPlayers", "nameplateShowFriends" }
+
+local function NPI_FriendlyPlatesOn()
+    for _, name in ipairs(NPI_PlateCVars) do
+        local value = NPI_ReadCVar(name)
+        if value ~= nil then
+            return value, name
         end
     end
-end
-
-function NPI_Addon:Toggle()
-    if self.enabled then
-        self:Disable()
-    else
-        self:Enable()
+    if GetCVarBool then
+        for _, name in ipairs(NPI_PlateCVars) do
+            local ok, value = pcall(GetCVarBool, name)
+            if ok and value == true then
+                return true, name
+            end
+        end
     end
-    NPI_Print(NPI_Verbosity.default, string.format(L.AUTO_INVITE_TOGGLE, self.enabled and L.ENABLED_VALUE or L.DISABLED_VALUE))
+    return nil, nil
 end
 
--- Confirmation popup
-StaticPopupDialogs["NPI_CONFIRM_INVITE"] = {
-    text = L.INVITE_CONFIRM,
-    button1 = YES,
-    button2 = NO,
-    button3 = L.DISABLE_ADDON,
-      OnAccept = function(self, data)
-          InviteUnit(data.name)
-          NPI_Addon.invited[data.name] = true
-          NPI_Addon.pendingInvites[data.name] = true
-          C_Timer.After(60, function()
-              if not NPI_IsPlayerInGroup(data.name) then
-                  NPI_Addon.pendingInvites[data.name] = nil
-              end
-          end)
-          NPI_Print(NPI_Verbosity.default, string.format(L.INVITED, data.name))
-          if NPI_Settings.whisperEnabled and NPI_Settings.whisperMessage ~= "" then
-              NPI_PendingWhisper = data.name
-              C_Timer.After(1, function()
-                  if NPI_PendingWhisper == data.name then
-                    SendChatMessage(NPI_Settings.whisperMessage, "WHISPER", nil, data.name)
-                    NPI_PendingWhisper = nil
-                end
-            end)
-        else
-            NPI_PendingWhisper = nil
-        end
-          NPI_PendingInvite = nil
-      end,
-    OnCancel = function(_, data)
-        NPI_Addon.ignored[data.name] = true
-        NPI_Print(NPI_Verbosity.default, string.format(L.IGNORED, data.name))
-      NPI_PendingInvite = nil
-  end,
-    OnAlt = function()
-        NPI_Addon:Disable()
-        NPI_Print(NPI_Verbosity.default, string.format(L.AUTO_INVITE_TOGGLE, L.DISABLED_VALUE))
-        NPI_PendingInvite = nil
-    end,
-    timeout = 0,
-    whileDead = 1,
-    hideOnEscape = 1,
-    preferredIndex = 3,
-}
-
--- Combat log handler
-local NPI_bitBand = bit.band
-function NPI_Frame:COMBAT_LOG_EVENT_UNFILTERED()
-    if not NPI_Addon.enabled or NPI_PendingInvite then return end
-    if NPI_IsGroupFull() then
-        if not NPI_GroupFullWarned then
-            NPI_Print(NPI_Verbosity.default, L.GROUP_FULL)
-            NPI_GroupFullWarned = true
-        end
+function NPI_Addon:EnableFriendlyNameplates()
+    if InCombatLockdown() then
+        NPI_Print(NPI_Verbosity.default, L.PLATES_COMBAT)
         return
-    else
-        NPI_GroupFullWarned = false
     end
-
-    local _, _, _, NPI_SourceGUID, NPI_SourceName, NPI_SourceFlags = CombatLogGetCurrentEventInfo()
-    if not NPI_SourceName or NPI_SourceName == NPI_PlayerFullName then return end
-
-    if NPI_bitBand(NPI_SourceFlags, COMBATLOG_OBJECT_TYPE_PLAYER) == 0 then return end
-    if NPI_bitBand(NPI_SourceFlags, COMBATLOG_OBJECT_REACTION_FRIENDLY) == 0 then return end
-
-    NPI_Print(NPI_Verbosity.debug, string.format(L.COMBAT_LOG_EVENT, NPI_SourceName))
-    NPI_StartInvite(NPI_SourceName)
+    if UnitIsDeadOrGhost("player") then
+        NPI_Print(NPI_Verbosity.default, L.PLATES_DEAD)
+        return
+    end
+    local enabled, name = NPI_FriendlyPlatesOn()
+    local setter = (C_CVar and C_CVar.SetCVar) or SetCVar
+    if not name or not setter then
+        NPI_Print(NPI_Verbosity.default, L.PLATES_UNSUPPORTED)
+        return
+    end
+    if not enabled then
+        pcall(setter, name, "1")
+    end
+    if NPI_FriendlyPlatesOn() ~= true then
+        NPI_Print(NPI_Verbosity.default, L.PLATES_FAILED)
+        return
+    end
+    if NPI_ReadCVar("nameplateShowAll") == false then
+        pcall(setter, "nameplateShowAll", "1")
+        if NPI_ReadCVar("nameplateShowAll") ~= true then
+            NPI_Print(NPI_Verbosity.default, L.PLATES_PARTIAL)
+            NPI_RefreshWindow()
+            return
+        end
+    end
+    NPI_Print(NPI_Verbosity.default, L.PLATES_ON)
+    NPI_RefreshWindow()
 end
 
-local function NPI_CheckUnit(NPI_Unit)
-    NPI_Print(NPI_Verbosity.debug, string.format(L.CHECKING_UNIT, NPI_Unit))
-    if not UnitExists(NPI_Unit) or not UnitIsPlayer(NPI_Unit) then return end
-    local NPI_Name, NPI_Realm = UnitName(NPI_Unit)
-    local NPI_FullName = NPI_Realm and NPI_Realm ~= "" and NPI_Name .. "-" .. NPI_Realm or NPI_Name
-    if NPI_FullName == NPI_PlayerFullName then return end
-    if UnitFactionGroup(NPI_Unit) ~= NPI_PlayerFaction then return end
-    NPI_Print(NPI_Verbosity.high, string.format(L.DETECTED, NPI_FullName))
-    NPI_StartInvite(NPI_FullName)
+local function NPI_WarnPlates()
+    if NPI_PlatesWarned then
+        return
+    end
+    if NPI_FriendlyPlatesOn() == false then
+        NPI_PlatesWarned = true
+        NPI_Print(NPI_Verbosity.default, L.PLATES_OFF .. " " .. L.PLATES_HINT)
+    end
+end
+
+local function NPI_DistanceBand(unit)
+    local function interact(index)
+        if not CheckInteractDistance then
+            return false
+        end
+        local ok, value = pcall(CheckInteractDistance, unit, index)
+        return ok and value and true or false
+    end
+    if interact(3) or interact(2) then
+        return 1, L.DISTANCE_10
+    end
+    if interact(1) or interact(4) then
+        return 2, L.DISTANCE_28
+    end
+    return 3, L.DISTANCE_NEAR
+end
+
+local function NPI_FullName(unit)
+    local name, realm = UnitName(unit)
+    if not name or name == "" then
+        return nil, nil
+    end
+    if not realm or realm == "" then
+        return name, name
+    end
+    return name .. "-" .. realm, name
+end
+
+local function NPI_Consider(unit, seen, list)
+    if not unit or not UnitExists(unit) or not UnitIsPlayer(unit) then
+        return
+    end
+    if UnitIsUnit(unit, "player") then
+        return
+    end
+    local faction = UnitFactionGroup(unit)
+    if not faction or not NPI_PlayerFaction or faction ~= NPI_PlayerFaction then
+        return
+    end
+    local full, short = NPI_FullName(unit)
+    if not full then
+        return
+    end
+    if NPI_IsPlayerInGroup(full) or NPI_IsPlayerInGroup(short) then
+        return
+    end
+    local guid = UnitGUID(unit)
+    if not guid or seen[guid] then
+        return
+    end
+    seen[guid] = true
+    local band, label = NPI_DistanceBand(unit)
+    local _, class = UnitClass(unit)
+    local ask = NPI_Asks[NPI_NameKey(full)] or NPI_Asks[NPI_NameKey(short)]
+    list[#list + 1] = {
+        guid = guid,
+        unit = unit,
+        fullName = full,
+        name = short,
+        class = class,
+        band = band,
+        distance = label,
+        ask = ask,
+    }
+end
+
+local function NPI_ExpireAsks()
+    local now = GetTime()
+    for _, ask in pairs(NPI_Asks) do
+        if ask.status == "waiting" and ask.expires and ask.expires <= now then
+            ask.status = nil
+            ask.expires = nil
+        end
+    end
+end
+
+function NPI_ScanNearby()
+    NPI_ExpireAsks()
+    local seen = {}
+    local list = {}
+    for i = 1, 40 do
+        NPI_Consider("nameplate" .. i, seen, list)
+    end
+    NPI_Consider("target", seen, list)
+    NPI_Consider("mouseover", seen, list)
+    table.sort(list, function(a, b)
+        if a.band ~= b.band then
+            return a.band < b.band
+        end
+        return a.name < b.name
+    end)
+    NPI_Nearby = list
+    local maxOffset = math.max(0, #list - NPI_MAX_ROWS)
+    if NPI_RowOffset > maxOffset then
+        NPI_RowOffset = maxOffset
+    end
+    if NPI_PaintRows then
+        NPI_PaintRows()
+    end
+end
+
+local function NPI_QuestCount()
+    if C_QuestLog and C_QuestLog.GetNumQuestLogEntries then
+        local ok, count = pcall(C_QuestLog.GetNumQuestLogEntries)
+        if ok and type(count) == "number" then
+            return count
+        end
+    end
+    if GetNumQuestLogEntries then
+        return GetNumQuestLogEntries()
+    end
+    return 0
+end
+
+local function NPI_QuestKey(questID, title)
+    if type(questID) == "number" and questID > 0 then
+        return "id:" .. questID
+    end
+    return "title:" .. (title or "")
+end
+
+local function NPI_ReadQuest(index)
+    if C_QuestLog and C_QuestLog.GetInfo then
+        local ok, info = pcall(C_QuestLog.GetInfo, index)
+        if ok and type(info) == "table" and not info.isHeader and info.title and info.title ~= "" then
+            return info.questID, info.title
+        end
+        if ok and type(info) == "table" then
+            return nil, nil
+        end
+    end
+    if not GetQuestLogTitle then
+        return nil, nil
+    end
+    local title, _, _, isHeader, _, _, _, questID = GetQuestLogTitle(index)
+    if isHeader or not title or title == "" then
+        return nil, nil
+    end
+    return questID, title
+end
+
+function NPI_GetQuests()
+    local quests = {}
+    local count = NPI_QuestCount()
+    for index = 1, count do
+        local questID, title = NPI_ReadQuest(index)
+        if title then
+            quests[#quests + 1] = {
+                id = questID,
+                title = title,
+                key = NPI_QuestKey(questID, title),
+            }
+        end
+    end
+    return quests
+end
+
+function NPI_SelectedQuestTitle()
+    local key = NPI_Settings.selectedQuestKey
+    if not key then
+        return nil
+    end
+    local quests = NPI_GetQuests()
+    if #quests == 0 then
+        return NPI_Settings.selectedQuestTitle
+    end
+    for _, quest in ipairs(quests) do
+        if quest.key == key then
+            NPI_Settings.selectedQuestTitle = quest.title
+            return quest.title
+        end
+    end
+    return nil
+end
+
+local function NPI_SyncQuestDropdown()
+    if not NPI_QuestDropDown then
+        return
+    end
+    local quests = NPI_GetQuests()
+    local found
+    for _, quest in ipairs(quests) do
+        if quest.key == NPI_Settings.selectedQuestKey then
+            found = quest
+            break
+        end
+    end
+    if found then
+        NPI_Settings.selectedQuestTitle = found.title
+        UIDropDownMenu_SetSelectedValue(NPI_QuestDropDown, found.key)
+        UIDropDownMenu_SetText(NPI_QuestDropDown, found.title)
+    elseif #quests > 0 then
+        NPI_Settings.selectedQuestKey = nil
+        NPI_Settings.selectedQuestTitle = nil
+        UIDropDownMenu_SetSelectedValue(NPI_QuestDropDown, nil)
+        UIDropDownMenu_SetText(NPI_QuestDropDown, L.NO_QUESTS)
+    else
+        UIDropDownMenu_SetText(NPI_QuestDropDown, L.NO_QUESTS)
+    end
+    if NPI_PaintRows then
+        NPI_PaintRows()
+    end
+end
+
+local function NPI_QuestDropdown_OnClick(button)
+    local key = button.value
+    local title
+    for _, quest in ipairs(NPI_GetQuests()) do
+        if quest.key == key then
+            title = quest.title
+            break
+        end
+    end
+    NPI_Settings.selectedQuestKey = key
+    NPI_Settings.selectedQuestTitle = title
+    UIDropDownMenu_SetSelectedValue(NPI_QuestDropDown, key)
+    UIDropDownMenu_SetText(NPI_QuestDropDown, title or L.NO_QUESTS)
+    NPI_PaintRows()
+end
+
+local function NPI_QuestDropdown_Initialize()
+    local quests = NPI_GetQuests()
+    if #quests == 0 then
+        local info = UIDropDownMenu_CreateInfo()
+        info.text = L.NO_QUESTS
+        info.disabled = true
+        UIDropDownMenu_AddButton(info)
+        return
+    end
+    for _, quest in ipairs(quests) do
+        local title = quest.title
+        local key = quest.key
+        local info = UIDropDownMenu_CreateInfo()
+        info.text = title
+        info.value = key
+        info.func = NPI_QuestDropdown_OnClick
+        info.checked = (NPI_Settings.selectedQuestKey == key)
+        UIDropDownMenu_AddButton(info)
+    end
+end
+
+local function NPI_AskText(title)
+    local custom = NPI_Settings.whisperEnabled and NPI_Settings.whisperMessage or ""
+    if custom ~= "" then
+        return (custom:gsub("%%s", function()
+            return title
+        end))
+    end
+    return string.format(L.ASK_DEFAULT, title)
+end
+
+local function NPI_RememberAsk(full, short, title)
+    local ask = {
+        status = "waiting",
+        expires = GetTime() + 120,
+        quest = title,
+        fullName = full,
+        name = short,
+    }
+    local fullKey = NPI_NameKey(full)
+    local shortKey = NPI_NameKey(short)
+    if fullKey then
+        NPI_Asks[fullKey] = ask
+    end
+    if shortKey then
+        NPI_Asks[shortKey] = ask
+    end
+end
+
+function NPI_AskPlayer(entry)
+    local title = NPI_SelectedQuestTitle()
+    if not title then
+        NPI_Print(NPI_Verbosity.default, L.NO_QUEST_SELECTED)
+        return
+    end
+    local message = NPI_AskText(title)
+    SendChatMessage(message, "WHISPER", nil, entry.fullName)
+    NPI_RememberAsk(entry.fullName, entry.name, title)
+    NPI_Print(NPI_Verbosity.default, string.format(L.ASK_SENT, entry.name, title))
+    NPI_ScanNearby()
+end
+
+function NPI_InvitePlayer(entry)
+    if NPI_IsPlayerInGroup(entry.fullName) or NPI_IsPlayerInGroup(entry.name) then
+        NPI_Print(NPI_Verbosity.default, string.format(L.ALREADY_IN_GROUP, entry.name))
+        NPI_ScanNearby()
+        return
+    end
+    if NPI_IsGroupFull() then
+        NPI_Print(NPI_Verbosity.default, L.GROUP_FULL)
+        return
+    end
+    InviteUnit(entry.fullName)
+    NPI_Addon.invited[entry.fullName] = true
+    NPI_Addon.pendingInvites[entry.fullName] = true
+    local invitedName = entry.fullName
+    if C_Timer and C_Timer.After then
+        C_Timer.After(60, function()
+            if not NPI_IsPlayerInGroup(invitedName) then
+                NPI_Addon.pendingInvites[invitedName] = nil
+            end
+        end)
+    end
+    NPI_Print(NPI_Verbosity.default, string.format(L.INVITED, entry.name))
+end
+
+local function NPI_FindAsk(sender)
+    local key = NPI_NameKey(sender)
+    if key and NPI_Asks[key] then
+        return NPI_Asks[key]
+    end
+    local short = type(sender) == "string" and sender:match("^([^%-]+)") or nil
+    local shortKey = NPI_NameKey(short)
+    if shortKey and NPI_Asks[shortKey] then
+        return NPI_Asks[shortKey]
+    end
+end
+
+local function NPI_FirstWord(message)
+    if type(message) ~= "string" then
+        return nil
+    end
+    return message:lower():match("^%s*([%a]+)")
+end
+
+function NPI_PaintRows()
+    if not NPI_Window then
+        return
+    end
+    local count = #NPI_Nearby
+    for i = 1, NPI_MAX_ROWS do
+        local row = NPI_Rows[i]
+        local entry = NPI_Nearby[NPI_RowOffset + i]
+        if entry then
+            row:Show()
+            row.entry = entry
+            local color = RAID_CLASS_COLORS and entry.class and RAID_CLASS_COLORS[entry.class]
+            if color then
+                row.name:SetTextColor(color.r, color.g, color.b)
+            else
+                row.name:SetTextColor(1, 1, 1)
+            end
+            row.name:SetText(entry.name)
+            row.distance:SetText(entry.distance)
+            local status = entry.ask and entry.ask.status
+            if status == "waiting" then
+                row.status:SetText(L.STATUS_WAITING)
+            elseif status == "yes" then
+                row.status:SetText(L.STATUS_ACCEPTED)
+            elseif status == "no" then
+                row.status:SetText(L.STATUS_DECLINED)
+            else
+                row.status:SetText("")
+            end
+            local title = NPI_SelectedQuestTitle()
+            row.ask:SetEnabled(title ~= nil and status ~= "waiting")
+            row.invite:SetEnabled(true)
+        else
+            row:Hide()
+            row.entry = nil
+        end
+    end
+    if count == 0 then
+        if NPI_FriendlyPlatesOn() == false then
+            NPI_EmptyText:SetText(L.PLATES_OFF .. " " .. L.PLATES_HINT)
+        else
+            NPI_EmptyText:SetText(L.EMPTY_NEARBY)
+        end
+        NPI_EmptyText:Show()
+    else
+        NPI_EmptyText:Hide()
+    end
+end
+
+function NPI_RefreshWindow()
+    NPI_SyncQuestDropdown()
+    NPI_ScanNearby()
+end
+
+local function NPI_SaveWindowPosition()
+    if not NPI_Window then
+        return
+    end
+    local point, _, rel, x, y = NPI_Window:GetPoint(1)
+    NPI_Settings.window = { point = point, rel = rel, x = x, y = y }
+end
+
+local function NPI_ToggleWindow()
+    if not NPI_Window then
+        return
+    end
+    if NPI_Window:IsShown() then
+        NPI_Window:Hide()
+    else
+        NPI_Window:Show()
+        NPI_RefreshWindow()
+    end
+end
+
+local function NPI_CreateWindow()
+    local backdrop = {
+        bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+        tile = true,
+        tileSize = 32,
+        edgeSize = 32,
+        insets = { left = 11, right = 12, top = 12, bottom = 11 },
+    }
+    local window = CreateFrame("Frame", "NPI_NearbyFrame", UIParent, BackdropTemplateMixin and "BackdropTemplate" or nil)
+    NPI_Window = window
+    window:SetSize(380, 280)
+    window:SetFrameStrata("MEDIUM")
+    window:SetClampedToScreen(true)
+    window:SetMovable(true)
+    window:EnableMouse(true)
+    window:RegisterForDrag("LeftButton")
+    window:SetScript("OnDragStart", function(self)
+        self:StartMoving()
+    end)
+    window:SetScript("OnDragStop", function(self)
+        self:StopMovingOrSizing()
+        NPI_SaveWindowPosition()
+    end)
+    if window.SetBackdrop then
+        window:SetBackdrop(backdrop)
+    end
+    local saved = NPI_Settings.window
+    if saved and saved.point then
+        window:SetPoint(saved.point, UIParent, saved.rel or saved.point, saved.x or 0, saved.y or 0)
+    else
+        window:SetPoint("CENTER")
+    end
+
+    local title = window:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOP", 0, -14)
+    title:SetText(L.ADDON_TITLE)
+
+    local close = CreateFrame("Button", nil, window, "UIPanelCloseButton")
+    close:SetPoint("TOPRIGHT", -4, -4)
+    close:SetScript("OnClick", function()
+        window:Hide()
+    end)
+
+    local questLabel = window:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    questLabel:SetPoint("TOPLEFT", 20, -36)
+    questLabel:SetText(L.QUEST)
+
+    NPI_QuestDropDown = CreateFrame("Frame", "NPI_QuestDropDown", window, "UIDropDownMenuTemplate")
+    NPI_QuestDropDown:SetPoint("TOPLEFT", questLabel, "BOTTOMLEFT", -16, -2)
+    UIDropDownMenu_SetWidth(NPI_QuestDropDown, 200)
+    UIDropDownMenu_Initialize(NPI_QuestDropDown, NPI_QuestDropdown_Initialize)
+    UIDropDownMenu_SetText(NPI_QuestDropDown, L.NO_QUESTS)
+
+    NPI_EmptyText = window:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    NPI_EmptyText:SetPoint("TOPLEFT", 24, -100)
+    NPI_EmptyText:SetPoint("TOPRIGHT", -24, -100)
+    NPI_EmptyText:SetJustifyH("CENTER")
+    NPI_EmptyText:SetText(L.EMPTY_NEARBY)
+
+    window:EnableMouseWheel(true)
+    window:SetScript("OnMouseWheel", function(_, delta)
+        NPI_RowOffset = NPI_RowOffset - delta
+        if NPI_RowOffset < 0 then
+            NPI_RowOffset = 0
+        end
+        local maxOffset = math.max(0, #NPI_Nearby - NPI_MAX_ROWS)
+        if NPI_RowOffset > maxOffset then
+            NPI_RowOffset = maxOffset
+        end
+        NPI_PaintRows()
+    end)
+
+    for i = 1, NPI_MAX_ROWS do
+        local row = CreateFrame("Frame", nil, window)
+        row:SetSize(348, NPI_ROW_HEIGHT)
+        row:SetPoint("TOPLEFT", 16, -88 - (i - 1) * NPI_ROW_HEIGHT)
+        local bg = row:CreateTexture(nil, "BACKGROUND")
+        bg:SetAllPoints()
+        if bg.SetColorTexture then
+            bg:SetColorTexture(1, 1, 1, i % 2 == 0 and 0.04 or 0.08)
+        else
+            bg:SetTexture("Interface\\Buttons\\WHITE8X8")
+            bg:SetVertexColor(1, 1, 1, i % 2 == 0 and 0.04 or 0.08)
+        end
+
+        row.name = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.name:SetPoint("LEFT", 6, 0)
+        row.name:SetWidth(120)
+        row.name:SetJustifyH("LEFT")
+        row.name:SetWordWrap(false)
+
+        row.distance = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.distance:SetPoint("LEFT", row.name, "RIGHT", 4, 0)
+        row.distance:SetWidth(36)
+        row.distance:SetJustifyH("LEFT")
+
+        row.status = row:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+        row.status:SetPoint("LEFT", row.distance, "RIGHT", 2, 0)
+        row.status:SetWidth(36)
+        row.status:SetJustifyH("LEFT")
+
+        row.ask = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+        row.ask:SetSize(64, 20)
+        row.ask:SetPoint("LEFT", row.status, "RIGHT", 4, 0)
+        row.ask:SetText(L.ASK)
+        row.ask:SetScript("OnClick", function(self)
+            if self:GetParent().entry then
+                NPI_AskPlayer(self:GetParent().entry)
+            end
+        end)
+
+        row.invite = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+        row.invite:SetSize(70, 20)
+        row.invite:SetPoint("LEFT", row.ask, "RIGHT", 4, 0)
+        row.invite:SetText(L.INVITE)
+        row.invite:SetScript("OnClick", function(self)
+            if self:GetParent().entry then
+                NPI_InvitePlayer(self:GetParent().entry)
+            end
+        end)
+
+        row:Hide()
+        NPI_Rows[i] = row
+    end
+
+    window:Hide()
+    NPI_SyncQuestDropdown()
+end
+
+function NPI_Frame:NAME_PLATE_UNIT_ADDED()
+    NPI_ScanNearby()
+end
+
+function NPI_Frame:NAME_PLATE_UNIT_REMOVED()
+    NPI_ScanNearby()
 end
 
 function NPI_Frame:UPDATE_MOUSEOVER_UNIT()
-    if not NPI_Addon.enabled or NPI_PendingInvite then return end
-    if NPI_IsGroupFull() then
-        if not NPI_GroupFullWarned then
-            NPI_Print(NPI_Verbosity.default, L.GROUP_FULL)
-            NPI_GroupFullWarned = true
-        end
-        return
-    else
-        NPI_GroupFullWarned = false
-    end
-    NPI_CheckUnit("mouseover")
+    NPI_ScanNearby()
 end
 
 function NPI_Frame:PLAYER_TARGET_CHANGED()
-    if not NPI_Addon.enabled or NPI_PendingInvite then return end
-    if NPI_IsGroupFull() then
-        if not NPI_GroupFullWarned then
-            NPI_Print(NPI_Verbosity.default, L.GROUP_FULL)
-            NPI_GroupFullWarned = true
-        end
+    NPI_ScanNearby()
+end
+
+function NPI_Frame:QUEST_LOG_UPDATE()
+    NPI_SyncQuestDropdown()
+end
+
+function NPI_Frame:CHAT_MSG_WHISPER(message, sender)
+    local ask = NPI_FindAsk(sender)
+    if not ask or ask.status ~= "waiting" then
         return
-    else
-        NPI_GroupFullWarned = false
     end
-    NPI_CheckUnit("target")
+    local word = NPI_FirstWord(message)
+    if word and NPI_YES[word] then
+        ask.status = "yes"
+        ask.expires = nil
+        NPI_Print(NPI_Verbosity.default, string.format(L.REPLY_ACCEPTED, ask.name or sender))
+    elseif word and NPI_NO[word] then
+        ask.status = "no"
+        ask.expires = nil
+        NPI_Print(NPI_Verbosity.default, string.format(L.REPLY_DECLINED, ask.name or sender))
+    end
+    NPI_PaintRows()
 end
 
 function NPI_Frame:CHAT_MSG_SYSTEM(msg)
-    -- ERR_ALREADY_IN_GROUP_S is a localized global provided by the WoW client
-    if NPI_PendingWhisper and msg == ERR_ALREADY_IN_GROUP_S:format(NPI_PendingWhisper) then
-        NPI_PendingWhisper = nil
-    end
     for NPI_Name in pairs(NPI_Addon.pendingInvites) do
         if msg == ERR_DECLINE_GROUP_S:format(NPI_Name) or msg == ERR_ALREADY_IN_GROUP_S:format(NPI_Name) then
             NPI_Addon.pendingInvites[NPI_Name] = nil
@@ -306,6 +805,30 @@ function NPI_Frame:GROUP_ROSTER_UPDATE()
             NPI_Addon.pendingInvites[NPI_Name] = nil
         end
     end
+    NPI_ScanNearby()
+end
+
+function NPI_Frame:CVAR_UPDATE(name)
+    if type(name) == "string" then
+        local lower = name:lower()
+        if lower == "nameplateshowfriendlyplayers" or lower == "nameplateshowfriends" or lower == "nameplateshowall" then
+            NPI_PaintRows()
+        end
+    end
+end
+
+function NPI_Frame:PLAYER_LOGIN()
+    NPI_UpdatePlayer()
+    NPI_WarnPlates()
+    NPI_RefreshWindow()
+    if not NPI_Ticker and C_Timer and C_Timer.NewTicker then
+        NPI_Ticker = C_Timer.NewTicker(0.5, NPI_ScanNearby)
+    end
+end
+
+function NPI_Frame:PLAYER_ENTERING_WORLD()
+    NPI_UpdatePlayer()
+    NPI_RefreshWindow()
 end
 
 NPI_Frame:SetScript("OnEvent", function(self, event, ...)
@@ -314,7 +837,36 @@ NPI_Frame:SetScript("OnEvent", function(self, event, ...)
     end
 end)
 
--- Minimap button setup
+local function NPI_TryRegister(event)
+    pcall(NPI_Frame.RegisterEvent, NPI_Frame, event)
+end
+
+NPI_TryRegister("PLAYER_LOGIN")
+NPI_TryRegister("PLAYER_ENTERING_WORLD")
+NPI_TryRegister("NAME_PLATE_UNIT_ADDED")
+NPI_TryRegister("NAME_PLATE_UNIT_REMOVED")
+NPI_TryRegister("UPDATE_MOUSEOVER_UNIT")
+NPI_TryRegister("PLAYER_TARGET_CHANGED")
+NPI_TryRegister("QUEST_LOG_UPDATE")
+NPI_TryRegister("CHAT_MSG_WHISPER")
+NPI_TryRegister("CHAT_MSG_SYSTEM")
+NPI_TryRegister("GROUP_ROSTER_UPDATE")
+NPI_TryRegister("CVAR_UPDATE")
+
+if not C_Timer or not C_Timer.NewTicker then
+    local elapsed = 0
+    NPI_Frame:SetScript("OnUpdate", function(_, dt)
+        elapsed = elapsed + dt
+        if elapsed < 0.5 then
+            return
+        end
+        elapsed = 0
+        NPI_ScanNearby()
+    end)
+end
+
+NPI_CreateWindow()
+
 local NPI_MinimapButton = CreateFrame("Button", "NPI_MinimapButton", Minimap)
 NPI_Addon.minimapButton = NPI_MinimapButton
 NPI_MinimapButton:SetFrameStrata("MEDIUM")
@@ -334,11 +886,10 @@ NPI_MinimapIcon:SetTexture("Interface\\AddOns\\NearbyPartyInvite\\NearbyPartyInv
 NPI_MinimapIcon:SetTexCoord(0.1, 0.9, 0.1, 0.9)
 NPI_MinimapIcon:SetSize(20, 20)
 NPI_MinimapIcon:SetPoint("CENTER")
-NPI_MinimapIcon:SetDesaturated(true)
 
 NPI_MinimapButton:SetScript("OnClick", function(_, button)
     if button == "LeftButton" then
-        NPI_Addon:Toggle()
+        NPI_ToggleWindow()
     end
 end)
 
@@ -353,29 +904,16 @@ NPI_MinimapButton:SetScript("OnLeave", function()
     GameTooltip:Hide()
 end)
 
--- Options panel
 NPI_Options = CreateFrame("Frame", "NPI_Options")
 NPI_Options.name = L.ADDON_TITLE
 
-NPI_EnableCheck = CreateFrame("CheckButton", "NPI_EnableCheck", NPI_Options, "InterfaceOptionsCheckButtonTemplate")
-NPI_EnableCheck:SetPoint("TOPLEFT", 16, -16)
-NPI_EnableCheck.Text:SetText(L.ENABLE_AUTO_INVITE)
-NPI_EnableCheck:SetChecked(NPI_Addon.enabled)
-NPI_EnableCheck:SetScript("OnClick", function(self)
-    if self:GetChecked() then
-        NPI_Addon:Enable()
-    else
-        NPI_Addon:Disable()
-    end
-end)
-
 NPI_WhisperCheck = CreateFrame("CheckButton", "NPI_WhisperCheck", NPI_Options, "InterfaceOptionsCheckButtonTemplate")
-NPI_WhisperCheck:SetPoint("TOPLEFT", NPI_EnableCheck, "BOTTOMLEFT", 0, -8)
+NPI_WhisperCheck:SetPoint("TOPLEFT", 16, -16)
 NPI_WhisperCheck.Text:SetText(L.ENABLE_WHISPER_MESSAGE)
 NPI_WhisperCheck:SetChecked(NPI_Settings.whisperEnabled)
 
 NPI_MessageInput = CreateFrame("EditBox", "NPI_MessageInput", NPI_Options, "InputBoxTemplate")
-NPI_MessageInput:SetSize(220, 25)
+NPI_MessageInput:SetSize(260, 25)
 NPI_MessageInput:SetAutoFocus(false)
 NPI_MessageInput:SetPoint("TOPLEFT", NPI_WhisperCheck, "BOTTOMLEFT", 30, -8)
 NPI_MessageInput:SetText(NPI_Settings.whisperMessage)
@@ -405,38 +943,13 @@ end)
 
 NPI_UpdateMessageInput()
 
-NPI_MouseoverCheck = CreateFrame("CheckButton", "NPI_MouseoverCheck", NPI_Options, "InterfaceOptionsCheckButtonTemplate")
-NPI_MouseoverCheck:SetPoint("TOPLEFT", NPI_MessageInput, "BOTTOMLEFT", -30, -8)
-NPI_MouseoverCheck.Text:SetText(L.SCAN_MOUSEOVER)
-NPI_MouseoverCheck:SetChecked(NPI_Settings.triggerMouseover)
-NPI_MouseoverCheck:SetScript("OnClick", function(self)
-    NPI_Settings.triggerMouseover = self:GetChecked()
-    if NPI_Addon.enabled then
-        if self:GetChecked() then
-            NPI_Frame:RegisterEvent("UPDATE_MOUSEOVER_UNIT")
-        else
-            NPI_Frame:UnregisterEvent("UPDATE_MOUSEOVER_UNIT")
-        end
-    end
-end)
-
-NPI_TargetCheck = CreateFrame("CheckButton", "NPI_TargetCheck", NPI_Options, "InterfaceOptionsCheckButtonTemplate")
-NPI_TargetCheck:SetPoint("TOPLEFT", NPI_MouseoverCheck, "BOTTOMLEFT", 0, -8)
-NPI_TargetCheck.Text:SetText(L.SCAN_TARGET_CHANGE)
-NPI_TargetCheck:SetChecked(NPI_Settings.triggerTarget)
-NPI_TargetCheck:SetScript("OnClick", function(self)
-    NPI_Settings.triggerTarget = self:GetChecked()
-    if NPI_Addon.enabled then
-        if self:GetChecked() then
-            NPI_Frame:RegisterEvent("PLAYER_TARGET_CHANGED")
-        else
-            NPI_Frame:UnregisterEvent("PLAYER_TARGET_CHANGED")
-        end
-    end
-end)
+local NPI_WhisperHint = NPI_Options:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+NPI_WhisperHint:SetPoint("TOPLEFT", NPI_MessageInput, "BOTTOMLEFT", -10, -6)
+NPI_WhisperHint:SetText(L.WHISPER_HINT)
+NPI_WhisperHint:SetJustifyH("LEFT")
 
 local NPI_VerbosityDropDown = CreateFrame("Frame", "NPI_VerbosityDropDown", NPI_Options, "UIDropDownMenuTemplate")
-NPI_VerbosityDropDown:SetPoint("TOPLEFT", NPI_TargetCheck, "BOTTOMLEFT", -16, -16)
+NPI_VerbosityDropDown:SetPoint("TOPLEFT", NPI_WhisperHint, "BOTTOMLEFT", -16, -16)
 UIDropDownMenu_SetWidth(NPI_VerbosityDropDown, 120)
 UIDropDownMenu_SetText(NPI_VerbosityDropDown, L.VERBOSITY)
 
@@ -483,12 +996,9 @@ NPI_VerbosityLabel:SetPoint("BOTTOMLEFT", NPI_VerbosityDropDown, "TOPLEFT", 16, 
 NPI_VerbosityLabel:SetText(L.VERBOSITY)
 
 NPI_Options:HookScript("OnShow", function()
-    NPI_EnableCheck:SetChecked(NPI_Addon.enabled)
     NPI_WhisperCheck:SetChecked(NPI_Settings.whisperEnabled)
     NPI_MessageInput:SetText(NPI_Settings.whisperMessage)
     NPI_UpdateMessageInput()
-    NPI_MouseoverCheck:SetChecked(NPI_Settings.triggerMouseover)
-    NPI_TargetCheck:SetChecked(NPI_Settings.triggerTarget)
     UIDropDownMenu_SetSelectedValue(NPI_VerbosityDropDown, NPI_Settings.verbosity)
     UIDropDownMenu_SetText(NPI_VerbosityDropDown, string.gsub(NPI_VerbosityNames[NPI_Settings.verbosity], "^%l", string.upper))
 end)
@@ -500,15 +1010,17 @@ else
     InterfaceOptions_AddCategory(NPI_Options)
 end
 
--- Chat commands
 SLASH_NPI1 = "/npi"
 SlashCmdList["NPI"] = function(NPI_Command)
     local NPI_Cmd, NPI_Rest = (NPI_Command or ""):match("^(%S*)%s*(.-)$")
-    NPI_Cmd = string.lower(NPI_Cmd)
-    if NPI_Cmd == "toggle" then
-        NPI_Addon:Toggle()
+    NPI_Cmd = string.lower(NPI_Cmd or "")
+    if NPI_Cmd == "" or NPI_Cmd == "toggle" or NPI_Cmd == "show" then
+        NPI_ToggleWindow()
     elseif NPI_Cmd == "status" then
-        NPI_Print(NPI_Verbosity.default, string.format(L.AUTO_INVITE_STATUS, NPI_Addon.enabled and L.ENABLED_VALUE or L.DISABLED_VALUE))
+        local title = NPI_SelectedQuestTitle() or L.NONE_VALUE
+        NPI_Print(NPI_Verbosity.default, string.format(L.NEARBY_STATUS, #NPI_Nearby, title))
+    elseif NPI_Cmd == "plates" then
+        NPI_Addon:EnableFriendlyNameplates()
     elseif NPI_Cmd == "message" then
         if NPI_Rest == "" then
             if NPI_Settings.whisperEnabled and NPI_Settings.whisperMessage ~= "" then
@@ -519,6 +1031,11 @@ SlashCmdList["NPI"] = function(NPI_Command)
         else
             NPI_Settings.whisperMessage = NPI_Rest
             NPI_Settings.whisperEnabled = true
+            if NPI_WhisperCheck then
+                NPI_WhisperCheck:SetChecked(true)
+                NPI_MessageInput:SetText(NPI_Rest)
+                NPI_UpdateMessageInput()
+            end
             NPI_Print(NPI_Verbosity.default, string.format(L.WHISPER_MESSAGE_SET, NPI_Rest))
         end
     elseif NPI_Cmd == "verbosity" then
@@ -537,4 +1054,3 @@ SlashCmdList["NPI"] = function(NPI_Command)
         NPI_Print(NPI_Verbosity.default, L.COMMANDS)
     end
 end
-

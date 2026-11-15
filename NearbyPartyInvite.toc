@@ -1,8 +1,8 @@
 ## Interface: 50500
 ## Title: NearbyPartyInvite
-## Notes: Prompt to invite nearby friendly players based on combat log
+## Notes: Lists nearby friendly players so you can ask them to group for a quest
 ## Author: Yaya RJB
-## Version: 0.1.0
+## Version: 0.2.0
 ## IconTexture: Interface\\AddOns\\NearbyPartyInvite\\NearbyPartyInvite_icon
 ## X-Curse-Project-ID: 1324134
 ## SavedVariables: NPI_Settings
