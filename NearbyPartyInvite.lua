@@ -464,6 +464,251 @@ local function NPI_QuestDropdown_Initialize()
     end
 end
 
+local NPI_NEAR_YARDS = 250
+local NPI_WHISPER_LIMIT = 255
+local NPI_NearbyQuests = {}
+local NPI_FocusedTitle
+local NPI_NearbyQuestText
+
+local function NPI_DonNS()
+    if type(DonData) ~= "table" or type(DonData.ns) ~= "table" then
+        return nil
+    end
+    local ns = DonData.ns
+    if type(ns.AvailableQuestsOnMap) ~= "function" or type(ns.DistanceFrom) ~= "function" or type(ns.PlayerWorld) ~= "function" then
+        return nil
+    end
+    return ns
+end
+
+local function NPI_SelectedQuestID()
+    local key = NPI_Settings and NPI_Settings.selectedQuestKey
+    if type(key) ~= "string" then
+        return nil
+    end
+    return tonumber(key:match("^id:(%d+)$"))
+end
+
+local function NPI_TitleForQuest(questID)
+    if type(questID) ~= "number" then
+        return nil
+    end
+    if type(DonDataAPI) == "table" and type(DonDataAPI.QuestTitle) == "function" then
+        local ok, title = pcall(DonDataAPI.QuestTitle, questID)
+        if ok and type(title) == "string" and title ~= "" then
+            return title
+        end
+    end
+    local ns = type(DonData) == "table" and DonData.ns
+    if type(ns) == "table" and type(ns.QuestTitle) == "function" then
+        local ok, title = pcall(ns.QuestTitle, questID)
+        if ok and type(title) == "string" and title ~= "" then
+            return title
+        end
+    end
+    return nil
+end
+
+local function NPI_FocusedQuest()
+    local title = NPI_SelectedQuestTitle()
+    if type(title) == "string" and title ~= "" then
+        return title, NPI_SelectedQuestID()
+    end
+    local ns = type(DonData) == "table" and DonData.ns
+    if type(ns) ~= "table" or type(ns.TrackerFocusID) ~= "function" then
+        return nil, nil
+    end
+    local ok, questID = pcall(ns.TrackerFocusID)
+    questID = ok and tonumber(questID) or nil
+    if not questID then
+        return nil, nil
+    end
+    local focusTitle = NPI_TitleForQuest(questID)
+    if not focusTitle then
+        return nil, nil
+    end
+    return focusTitle, questID
+end
+
+local function NPI_PlayerMap()
+    if not C_Map or type(C_Map.GetBestMapForUnit) ~= "function" then
+        return nil
+    end
+    local ok, mapID = pcall(C_Map.GetBestMapForUnit, "player")
+    if not ok then
+        return nil
+    end
+    return tonumber(mapID)
+end
+
+local function NPI_AvailableDistance(ns, mapID, x, y)
+    local ok, pc, pn, pw = pcall(ns.PlayerWorld)
+    if not ok or not pc then
+        return nil
+    end
+    local measured, dist = pcall(ns.DistanceFrom, pc, pn, pw, { mapID = mapID, x = x, y = y })
+    if measured and type(dist) == "number" then
+        return dist
+    end
+    return nil
+end
+
+local function NPI_LogQuestDistance(questID)
+    local api = DonDataAPI
+    if type(api) ~= "table" or type(api.DistanceTo) ~= "function" then
+        return nil
+    end
+    local best
+    local function consider(mapID, x, y)
+        if not mapID or not x or not y then
+            return
+        end
+        local ok, dist = pcall(api.DistanceTo, mapID, x, y)
+        if ok and type(dist) == "number" and (not best or dist < best) then
+            best = dist
+        end
+    end
+    if type(api.ObjectivePoints) == "function" then
+        local ok, points = pcall(api.ObjectivePoints, questID)
+        if ok and type(points) == "table" then
+            for _, point in ipairs(points) do
+                if type(point) == "table" then
+                    consider(point.mapID, point.x, point.y)
+                end
+            end
+        end
+    end
+    if type(api.QuestPOI) == "function" then
+        local ok, mapID, x, y = pcall(api.QuestPOI, questID)
+        if ok then
+            consider(mapID, x, y)
+        end
+    end
+    return best
+end
+
+local function NPI_CollectNearby(focusedTitle, focusedID)
+    local list = {}
+    local seen = {}
+    local function add(questID, title, dist)
+        if type(title) ~= "string" or title == "" then
+            return
+        end
+        if type(dist) ~= "number" or dist > NPI_NEAR_YARDS then
+            return
+        end
+        if focusedID and questID == focusedID then
+            return
+        end
+        if focusedTitle and title == focusedTitle then
+            return
+        end
+        local key = questID or title:lower()
+        local prev = seen[key]
+        if prev then
+            if dist < prev.dist then
+                prev.dist = dist
+            end
+            return
+        end
+        local entry = { questID = questID, title = title, dist = dist }
+        seen[key] = entry
+        list[#list + 1] = entry
+    end
+
+    local ns = NPI_DonNS()
+    if not ns then
+        return list
+    end
+
+    local mapID = NPI_PlayerMap()
+    if mapID then
+        local ok, available = pcall(ns.AvailableQuestsOnMap, mapID)
+        if ok and type(available) == "table" then
+            for _, quest in ipairs(available) do
+                if type(quest) == "table" and not quest.dimmed and quest.x and quest.y then
+                    local questID = tonumber(quest.questID)
+                    add(questID, NPI_TitleForQuest(questID), NPI_AvailableDistance(ns, mapID, quest.x, quest.y))
+                end
+            end
+        end
+    end
+
+    for _, quest in ipairs(NPI_GetQuests()) do
+        local questID = tonumber(quest.id)
+        if questID then
+            add(questID, quest.title, NPI_LogQuestDistance(questID))
+        end
+    end
+
+    table.sort(list, function(a, b)
+        if a.dist ~= b.dist then
+            return a.dist < b.dist
+        end
+        return a.title < b.title
+    end)
+    return list
+end
+
+local function NPI_JoinTitles(focused, nearby)
+    local parts = {}
+    if type(focused) == "string" and focused ~= "" then
+        parts[#parts + 1] = focused
+    end
+    for _, quest in ipairs(nearby) do
+        if type(quest.title) == "string" and quest.title ~= "" then
+            parts[#parts + 1] = quest.title
+        end
+    end
+    return parts
+end
+
+local function NPI_PlaceQuestLine()
+    if not NPI_Window then
+        return
+    end
+    local showLine = NPI_DonNS() ~= nil
+    NPI_Window:SetHeight(showLine and 320 or 280)
+    local top = showLine and -116 or -88
+    for i = 1, NPI_MAX_ROWS do
+        local row = NPI_Rows[i]
+        if row then
+            row:ClearAllPoints()
+            row:SetPoint("TOPLEFT", 16, top - (i - 1) * NPI_ROW_HEIGHT)
+        end
+    end
+    if NPI_EmptyText then
+        NPI_EmptyText:ClearAllPoints()
+        NPI_EmptyText:SetPoint("TOPLEFT", 24, top - 12)
+        NPI_EmptyText:SetPoint("TOPRIGHT", -24, top - 12)
+    end
+    if not NPI_NearbyQuestText then
+        return
+    end
+    if not showLine then
+        NPI_NearbyQuestText:Hide()
+        return
+    end
+    NPI_NearbyQuestText:Show()
+    local parts = NPI_JoinTitles(NPI_FocusedTitle, NPI_NearbyQuests)
+    if #parts == 0 then
+        NPI_NearbyQuestText:SetText(L.NO_NEARBY_QUESTS)
+    else
+        NPI_NearbyQuestText:SetText(string.format(L.NEARBY_QUESTS, table.concat(parts, ", ")))
+    end
+end
+
+local function NPI_RefreshNearbyQuests()
+    local title, questID = NPI_FocusedQuest()
+    NPI_FocusedTitle = title
+    if NPI_DonNS() then
+        NPI_NearbyQuests = NPI_CollectNearby(title, questID)
+    else
+        NPI_NearbyQuests = {}
+    end
+    NPI_PlaceQuestLine()
+end
+
 local function NPI_AskText(title)
     local custom = NPI_Settings.whisperEnabled and NPI_Settings.whisperMessage or ""
     if custom ~= "" then
@@ -472,6 +717,42 @@ local function NPI_AskText(title)
         end))
     end
     return string.format(L.ASK_DEFAULT, title)
+end
+
+local function NPI_MessageFor(titles)
+    return NPI_AskText(table.concat(titles, ", "))
+end
+
+local function NPI_FitTitles(titles)
+    local kept = {}
+    for i, title in ipairs(titles) do
+        kept[i] = title
+    end
+    if #kept == 0 then
+        return nil, nil
+    end
+    while #kept > 1 and #NPI_MessageFor(kept) > NPI_WHISPER_LIMIT do
+        kept[#kept] = nil
+    end
+    if #NPI_MessageFor(kept) <= NPI_WHISPER_LIMIT then
+        return NPI_MessageFor(kept), table.concat(kept, ", ")
+    end
+    local title = kept[1]
+    local low, high, best = 1, #title, nil
+    while low <= high do
+        local mid = math.floor((low + high) / 2)
+        local candidate = title:sub(1, mid)
+        if #NPI_MessageFor({ candidate }) <= NPI_WHISPER_LIMIT then
+            best = candidate
+            low = mid + 1
+        else
+            high = mid - 1
+        end
+    end
+    if not best or best == "" then
+        return nil, nil
+    end
+    return NPI_MessageFor({ best }), best
 end
 
 local function NPI_RememberAsk(full, short, title)
@@ -493,15 +774,20 @@ local function NPI_RememberAsk(full, short, title)
 end
 
 function NPI_AskPlayer(entry)
-    local title = NPI_SelectedQuestTitle()
-    if not title then
+    NPI_RefreshNearbyQuests()
+    local titles = NPI_JoinTitles(NPI_FocusedTitle, NPI_NearbyQuests)
+    if #titles == 0 then
         NPI_Print(NPI_Verbosity.default, L.NO_QUEST_SELECTED)
         return
     end
-    local message = NPI_AskText(title)
+    local message, shown = NPI_FitTitles(titles)
+    if not message or message == "" then
+        NPI_Print(NPI_Verbosity.default, L.NO_QUEST_SELECTED)
+        return
+    end
     SendChatMessage(message, "WHISPER", nil, entry.fullName)
-    NPI_RememberAsk(entry.fullName, entry.name, title)
-    NPI_Print(NPI_Verbosity.default, string.format(L.ASK_SENT, entry.name, title))
+    NPI_RememberAsk(entry.fullName, entry.name, shown)
+    NPI_Print(NPI_Verbosity.default, string.format(L.ASK_SENT, entry.name, shown))
     NPI_ScanNearby()
 end
 
@@ -552,6 +838,7 @@ function NPI_PaintRows()
     if not NPI_Window then
         return
     end
+    NPI_RefreshNearbyQuests()
     local count = #NPI_Nearby
     for i = 1, NPI_MAX_ROWS do
         local row = NPI_Rows[i]
@@ -577,8 +864,8 @@ function NPI_PaintRows()
             else
                 row.status:SetText("")
             end
-            local title = NPI_SelectedQuestTitle()
-            row.ask:SetEnabled(title ~= nil and status ~= "waiting")
+            local canAsk = (type(NPI_FocusedTitle) == "string" and NPI_FocusedTitle ~= "") or #NPI_NearbyQuests > 0
+            row.ask:SetEnabled(canAsk and status ~= "waiting")
             row.invite:SetEnabled(true)
         else
             row:Hide()
@@ -675,6 +962,14 @@ local function NPI_CreateWindow()
     UIDropDownMenu_SetWidth(NPI_QuestDropDown, 200)
     UIDropDownMenu_Initialize(NPI_QuestDropDown, NPI_QuestDropdown_Initialize)
     UIDropDownMenu_SetText(NPI_QuestDropDown, L.NO_QUESTS)
+
+    NPI_NearbyQuestText = window:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    NPI_NearbyQuestText:SetPoint("TOPLEFT", 20, -78)
+    NPI_NearbyQuestText:SetWidth(340)
+    NPI_NearbyQuestText:SetJustifyH("LEFT")
+    NPI_NearbyQuestText:SetWordWrap(true)
+    NPI_NearbyQuestText:SetText("")
+    NPI_NearbyQuestText:Hide()
 
     NPI_EmptyText = window:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     NPI_EmptyText:SetPoint("TOPLEFT", 24, -100)
@@ -785,6 +1080,10 @@ function NPI_Frame:CHAT_MSG_WHISPER(message, sender)
     elseif word and NPI_NO[word] then
         ask.status = "no"
         ask.expires = nil
+        local target = ask.fullName or sender
+        if type(target) == "string" and target ~= "" and type(L.REPLY_THANKS) == "string" and L.REPLY_THANKS ~= "" then
+            SendChatMessage(L.REPLY_THANKS, "WHISPER", nil, target)
+        end
         NPI_Print(NPI_Verbosity.default, string.format(L.REPLY_DECLINED, ask.name or sender))
     end
     NPI_PaintRows()
