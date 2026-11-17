@@ -6,5 +6,6 @@
 ## IconTexture: Interface\\AddOns\\NearbyPartyInvite\\NearbyPartyInvite_icon
 ## X-Curse-Project-ID: 1324134
 ## SavedVariables: NPI_Settings
+## OptionalDeps: DonData, Questdon
 Localization.lua
 NearbyPartyInvite.lua
